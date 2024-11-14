@@ -1,0 +1,272 @@
+<?php
+/*
+Plugin Name: WP Downgrade Plugin
+Description: Downgrade WordPress to a specific version selected by the admin.
+Version: 1.4
+Author: Daniel Oliveira da Paixao
+Text Domain: wpcm-downgrade
+Domain Path: /languages
+*/
+
+if (!defined('ABSPATH')) {
+    exit(__('Direct access not allowed.', 'wpcm-downgrade'));
+}
+
+// Definitions and constants
+define('WP_DOWNGRADE_MIN_VERSION', '5.0.0');
+define('WP_DOWNGRADE_PLUGIN_DIR', plugin_dir_path(__FILE__));
+define('WP_DOWNGRADE_TEMP_DIR', WP_DOWNGRADE_PLUGIN_DIR . 'temp/');
+
+// Plugin activation registration
+register_activation_hook(__FILE__, 'wp_downgrade_activate');
+function wp_downgrade_activate() {
+    if (!file_exists(WP_DOWNGRADE_TEMP_DIR)) {
+        wp_mkdir_p(WP_DOWNGRADE_TEMP_DIR);
+    }
+}
+
+// Load translations
+add_action('init', 'wp_downgrade_load_textdomain');
+function wp_downgrade_load_textdomain() {
+    load_plugin_textdomain('wpcm-downgrade', false, dirname(plugin_basename(__FILE__)) . '/languages');
+}
+
+// Admin menu
+add_action('admin_menu', 'wp_downgrade_menu');
+function wp_downgrade_menu() {
+    add_menu_page(
+        __('Downgrade WordPress', 'wpcm-downgrade'),
+        __('Downgrade WP', 'wpcm-downgrade'),
+        'manage_options',
+        'wp-downgrade',
+        'wp_downgrade_page',
+        'dashicons-update',
+        65
+    );
+}
+
+// Logging function
+function wp_downgrade_log($message) {
+    if (WP_DEBUG) {
+        error_log('[WP Downgrade] ' . $message);
+    }
+}
+
+// Main page
+function wp_downgrade_page() {
+    if (!current_user_can('manage_options')) {
+        wp_die(esc_html__('Permission denied.', 'wpcm-downgrade'));
+    }
+
+    // Form processing
+    if (isset($_POST['wp_downgrade_version']) && check_admin_referer('wp_downgrade_action')) {
+        $version = sanitize_text_field($_POST['wp_downgrade_version']);
+
+        if (!preg_match('/^\d+\.\d+(\.\d+)?$/', $version)) {
+            add_settings_error('wp_downgrade', 'format', __('Invalid version format.', 'wpcm-downgrade'));
+        } elseif (version_compare($version, WP_DOWNGRADE_MIN_VERSION, '<')) {
+            add_settings_error('wp_downgrade', 'version', sprintf(__('Minimum allowed version: %s', 'wpcm-downgrade'), WP_DOWNGRADE_MIN_VERSION));
+        } else {
+            wp_downgrade_execute($version);
+        }
+    }
+
+    ?>
+    <div class="wrap">
+        <h1><?php esc_html_e('Downgrade WordPress', 'wpcm-downgrade'); ?></h1>
+        <?php settings_errors(); ?>
+
+        <div class="notice notice-warning">
+            <p><strong><?php esc_html_e('WARNING:', 'wpcm-downgrade'); ?></strong>
+            <?php esc_html_e('Make a full backup before proceeding.', 'wpcm-downgrade'); ?></p>
+        </div>
+
+        <form method="post" action="">
+            <?php wp_nonce_field('wp_downgrade_action'); ?>
+            <table class="form-table">
+                <tr>
+                    <th scope="row">
+                        <label for="wp_downgrade_version"><?php esc_html_e('Version:', 'wpcm-downgrade'); ?></label>
+                    </th>
+                    <td>
+                        <input type="text"
+                               name="wp_downgrade_version"
+                               id="wp_downgrade_version"
+                               class="regular-text"
+                               required
+                               pattern="^\d+\.\d+(\.\d+)?$"
+                               placeholder="5.8.1">
+                    </td>
+                </tr>
+            </table>
+            <?php submit_button(__('Start Downgrade', 'wpcm-downgrade')); ?>
+        </form>
+    </div>
+    <?php
+}
+
+// Downgrade function
+function wp_downgrade_execute($version) {
+    global $wp_filesystem;
+
+    wp_downgrade_log("Starting downgrade to version " . $version);
+
+    // Preparation
+    require_once(ABSPATH . 'wp-admin/includes/file.php');
+    require_once(ABSPATH . 'wp-admin/includes/class-wp-filesystem-base.php');
+    require_once(ABSPATH . 'wp-admin/includes/class-wp-filesystem-direct.php');
+
+    if (!function_exists('WP_Filesystem')) {
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+    }
+
+    WP_Filesystem();
+
+    if (!$wp_filesystem) {
+        $wp_filesystem = new WP_Filesystem_Direct(null);
+    }
+
+    // Download
+    $download_url = "https://wordpress.org/wordpress-{$version}.zip";
+    wp_downgrade_log("Download URL: " . $download_url);
+
+    // Check if version exists
+    $headers = get_headers($download_url);
+    if (!$headers || strpos($headers[0], '200') === false) {
+        wp_downgrade_log("Version not found: " . $version);
+        add_settings_error('wp_downgrade', 'download', __('Version not found in the repository.', 'wpcm-downgrade'));
+        return false;
+    }
+
+    // Create temporary directory if it doesn’t exist
+    if (!file_exists(WP_DOWNGRADE_TEMP_DIR)) {
+        wp_mkdir_p(WP_DOWNGRADE_TEMP_DIR);
+    }
+
+    // Download file
+    $temp_file = WP_DOWNGRADE_TEMP_DIR . "wordpress-{$version}.zip";
+    $download_result = wp_downgrade_download_file($download_url, $temp_file);
+
+    if (!$download_result) {
+        wp_downgrade_log("Download failed");
+        add_settings_error('wp_downgrade', 'download', __('Failed to download WordPress.', 'wpcm-downgrade'));
+        return false;
+    }
+
+    // Backup critical files
+    $critical_files = array('wp-config.php', '.htaccess');
+    foreach ($critical_files as $file) {
+        if (file_exists(ABSPATH . $file)) {
+            copy(ABSPATH . $file, ABSPATH . $file . '.backup');
+        }
+    }
+
+    // Enable maintenance mode
+    file_put_contents(ABSPATH . '.maintenance', '<?php $upgrading = ' . time() . '; ?>');
+
+    try {
+        // Extract
+        wp_downgrade_log("Starting extraction");
+
+        require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
+        $archive = new PclZip($temp_file);
+
+        $result = $archive->extract(
+            PCLZIP_OPT_PATH, ABSPATH,
+            PCLZIP_OPT_REPLACE_NEWER,
+            PCLZIP_OPT_REMOVE_PATH, "wordpress"
+        );
+
+        if ($result === 0) {
+            throw new Exception($archive->errorInfo(true));
+        }
+
+        // Cleanup and finish
+        wp_downgrade_log("Downgrade completed successfully");
+        add_settings_error(
+            'wp_downgrade',
+            'success',
+            sprintf(__('Downgrade to version %s successful.', 'wpcm-downgrade'), $version),
+            'success'
+        );
+
+    } catch (Exception $e) {
+        wp_downgrade_log("Error during downgrade: " . $e->getMessage());
+
+        // Restore backups
+        foreach ($critical_files as $file) {
+            if (file_exists(ABSPATH . $file . '.backup')) {
+                rename(ABSPATH . $file . '.backup', ABSPATH . $file);
+            }
+        }
+
+        add_settings_error(
+            'wp_downgrade',
+            'error',
+            sprintf(__('Error: %s', 'wpcm-downgrade'), $e->getMessage()),
+            'error'
+        );
+
+    } finally {
+        // Final cleanup
+        if (file_exists($temp_file)) {
+            unlink($temp_file);
+        }
+        if (file_exists(ABSPATH . '.maintenance')) {
+            unlink(ABSPATH . '.maintenance');
+        }
+        foreach ($critical_files as $file) {
+            if (file_exists(ABSPATH . $file . '.backup')) {
+                unlink(ABSPATH . $file . '.backup');
+            }
+        }
+    }
+}
+
+// Download helper function
+function wp_downgrade_download_file($url, $path) {
+    wp_downgrade_log("Starting download from: " . $url);
+
+    $response = wp_remote_get($url, array(
+        'timeout' => 300,
+        'stream' => true,
+        'filename' => $path
+    ));
+
+    if (is_wp_error($response)) {
+        wp_downgrade_log("Download error: " . $response->get_error_message());
+        return false;
+    }
+
+    $response_code = wp_remote_retrieve_response_code($response);
+    if ($response_code !== 200) {
+        wp_downgrade_log("Unexpected HTTP response: " . $response_code);
+        return false;
+    }
+
+    return true;
+}
+
+// Cleanup on deactivation
+register_deactivation_hook(__FILE__, 'wp_downgrade_deactivate');
+function wp_downgrade_deactivate() {
+    // Remove temp directory
+    if (file_exists(WP_DOWNGRADE_TEMP_DIR)) {
+        wp_downgrade_remove_dir(WP_DOWNGRADE_TEMP_DIR);
+    }
+}
+
+// Directory removal helper function
+function wp_downgrade_remove_dir($dir) {
+    if (!is_dir($dir)) {
+        return;
+    }
+
+    $files = array_diff(scandir($dir), array('.', '..'));
+    foreach ($files as $file) {
+        $path = $dir . DIRECTORY_SEPARATOR . $file;
+        is_dir($path) ? wp_downgrade_remove_dir($path) : unlink($path);
+    }
+
+    return rmdir($dir);
+}
